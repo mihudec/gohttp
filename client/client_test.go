@@ -33,6 +33,7 @@ func (a *fakeAuth) Authorize(req *http.Request) error {
 	}
 	return nil
 }
+
 type fakeLimiter struct {
 	calls  int32
 	waitFn func(ctx context.Context) error
@@ -50,7 +51,11 @@ func (f *fakeLimiter) Wait(ctx context.Context) error {
 
 func newClient(t *testing.T, opts ...Option) *Client {
 	t.Helper()
-	return New(opts...)
+	c, err := New(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
 }
 
 func ctx(t *testing.T) context.Context {
@@ -82,7 +87,9 @@ func TestDoJSON_OK(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var out struct{ Version string `json:"version"` }
+	var out struct {
+		Version string `json:"version"`
+	}
 	resp, err := c.DoJSON(req, &out)
 	if err != nil {
 		t.Fatalf("DoJSON error: %v", err)
@@ -221,7 +228,6 @@ func TestRateLimiterInvoked(t *testing.T) {
 	}
 }
 
-
 func TestRateLimiterErrorBubblesUp(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("server should not be hit when limiter errors")
@@ -247,7 +253,6 @@ func TestRateLimiterErrorBubblesUp(t *testing.T) {
 		t.Fatalf("limiter calls=%d, want 1", got)
 	}
 }
-
 
 func TestDoPlainText(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -280,11 +285,9 @@ func TestMaxBodyCap(t *testing.T) {
 	req, _ := c.NewRequest(ctx(t), http.MethodGet, "/cap", nil, nil)
 
 	got, _, err := c.DoRequest(req)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if len(got) != 5 {
-		t.Fatalf("expected 5 bytes, got %d", len(got))
+	var sizeErr *BodyTooLargeError
+	if !errors.As(err, &sizeErr) || sizeErr.Limit != 5 || got != "" {
+		t.Fatalf("got %q, %v", got, err)
 	}
 }
 
@@ -299,6 +302,31 @@ func TestNewRequest_JoinPathAndUA(t *testing.T) {
 	}
 	if got := r.Header.Get("User-Agent"); got != "ua/1" {
 		t.Fatalf("ua=%s", got)
+	}
+}
+
+func TestNewRequest_BaseURLMissing(t *testing.T) {
+	c := newClient(t)
+	_, err := c.NewRequest(ctx(t), http.MethodGet, "/x", nil, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "baseURL") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestNewRequest_PathQueryMerged(t *testing.T) {
+	c := newClient(t, WithBaseURL("https://example.com"))
+	req, err := c.NewRequest(ctx(t), http.MethodGet, "/x?foo=bar", url.Values{"a": {"b"}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.URL.Query().Get("foo"); got != "bar" {
+		t.Fatalf("foo=%q", got)
+	}
+	if got := req.URL.Query().Get("a"); got != "b" {
+		t.Fatalf("a=%q", got)
 	}
 }
 
@@ -341,44 +369,76 @@ func TestWithProxy_SOCKS5_WiresDialContext(t *testing.T) {
 	}
 }
 
+func TestRetryWithBodyResent(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		body, _ := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if string(body) != `{"a":1}`+"\n" {
+			t.Fatalf("unexpected body: %q", string(body))
+		}
+		if atomic.LoadInt32(&hits) == 1 {
+			http.Error(w, "boom", 500)
+			return
+		}
+		io.WriteString(w, `{"ok":true}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := newClient(t, WithBaseURL(srv.URL), WithRetry(2), WithRetryMethods(http.MethodPost))
+	req, err := c.NewRequest(ctx(t), http.MethodPost, "/retry", nil, map[string]int{"a": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out map[string]any
+	_, err = c.DoJSON(req, &out)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if atomic.LoadInt32(&hits) != 2 {
+		t.Fatalf("hits=%d", hits)
+	}
+}
 
 func TestDoRequest_ContextDeadlineExceededBeforeLimiter(t *testing.T) {
-    var hitServer atomic.Bool
+	var hitServer atomic.Bool
 
-    srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        hitServer.Store(true)
-    }))
-    t.Cleanup(srv.Close)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitServer.Store(true)
+	}))
+	t.Cleanup(srv.Close)
 
-    // Limiter that sleeps longer than our ctx deadline
-    lim := &fakeLimiter{
-        waitFn: func(ctx context.Context) error {
-            time.Sleep(5 * time.Millisecond)
-            return nil
-        },
-    }
+	// Limiter that sleeps longer than our ctx deadline
+	lim := &fakeLimiter{
+		waitFn: func(ctx context.Context) error {
+			time.Sleep(5 * time.Millisecond)
+			return nil
+		},
+	}
 
-    c := newClient(t,
-        WithBaseURL(srv.URL),
-        WithRateLimiter(lim),
-    )
+	c := newClient(t,
+		WithBaseURL(srv.URL),
+		WithRateLimiter(lim),
+	)
 
-    ctx, cancel := context.WithTimeout(context.Background(), 500*time.Microsecond)
-    defer cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Microsecond)
+	defer cancel()
 
-    req, err := c.NewRequest(ctx, http.MethodGet, "/", nil, nil)
-    if err != nil {
-        t.Fatal(err)
-    }
+	req, err := c.NewRequest(ctx, http.MethodGet, "/", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-    _, _, err = c.DoRequest(req)
-    if err == nil {
-        t.Fatal("expected error, got nil")
-    }
-    if !errors.Is(err, context.DeadlineExceeded) {
-        t.Fatalf("expected context.DeadlineExceeded, got %v", err)
-    }
-    if hitServer.Load() {
-        t.Fatal("server was hit but should not have been")
-    }
+	_, _, err = c.DoRequest(req)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+	}
+	if hitServer.Load() {
+		t.Fatal("server was hit but should not have been")
+	}
 }

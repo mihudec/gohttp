@@ -1,10 +1,10 @@
-module github.com/mihudec/httpclient
+module github.com/mihudec/gohttp
 
-go 1.24.1
+go 1.27.4
 
 require (
-	go.uber.org/zap v1.27.0
-	golang.org/x/net v0.43.0
+	go.uber.org/zap v1.28.0
+	golang.org/x/net v0.63.0
 )
 
-require go.uber.org/multierr v1.10.0 // indirect
+require go.uber.org/multierr v1.11.0 // indirect
